@@ -92,7 +92,7 @@ def equivalent(gold: str, pred: str) -> bool:
 
 def main():
     gold_path = "math_level12_easy_test100_teacher.jsonl"
-    pred_path = "preds.jsonl"  # ここを自分の予測ファイル名に
+    pred_path = "team_a_preds.jsonl"  # ここを自分の予測ファイル名に
 
     gold_rows = load_jsonl(gold_path)
     pred_rows = load_jsonl(pred_path)
