@@ -1,10 +1,11 @@
 import os
 import json
+import asyncio
 import time
 import re
 from collections import Counter
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 # --- Dynamic few-shot 用（ローカル類似度計算） ---
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -22,18 +23,21 @@ API_KEY_FILE = "API.txt"
 # 実験用設定
 TRAIN_FILE = "math_train80.jsonl"
 TEST_FILE = "math_val20.jsonl"
-OUTPUT_FILE = "val20_preds.jsonl"
+OUTPUT_FILE = "val20_preds_async.jsonl"
 MODEL = "gpt-4o-mini"
 
 # Dynamic few-shot: 類似例を何個入れるか
-DYNAMIC_FEW_SHOT_K = 5
+DYNAMIC_FEW_SHOT_K = 7
 
 # Self-consistency: 何本生成して多数決するか
-SC_SAMPLES = 9
+SC_SAMPLES = 15
 SC_TEMPERATURE = 0.7
 
 # 生成トークン上限（推論過程を含むので多めに）
 MAX_TOKENS = 1500
+
+# 並列実行数の制限（レート制限対策）
+MAX_CONCURRENT = 8  # 同時に処理する問題数
 
 
 def read_api_key(file_path: str) -> str:
@@ -145,10 +149,6 @@ def clean_answer(answer: str) -> str:
 def extract_final_answer(text: str):
     """
     推論過程から最終的な答えを抽出する。
-    - FINAL: を優先
-    - \boxed{...} を次に優先
-    - 最後の数値や式を探す（推論過程の最後の答えらしい部分）
-    - 最後の非空行を最後の手段として使用
     """
     if text is None:
         return None
@@ -187,15 +187,14 @@ def extract_final_answer(text: str):
                     cleaned = clean_answer(candidate)
                     if cleaned and not re.match(r'^[A-Za-z\s]+$', cleaned):  # 英字だけの文章でない
                         return cleaned
-            
+
             # 数値や式パターンを直接探す（より具体的に）
             # LaTeX式を優先し、次に数値（複雑な式から単純な数値の順）
             complete_patterns = [
                 r'\\frac\{[^}]+\}\{[^}]+\}',  # 分数（最優先）
                 r'\\sqrt\{[^}]+\}',  # 平方根
                 r'\d+\.\d+',  # 小数
-                r'[0-9\+\-\*/\(\)\^]+',  # 数式（^を含む）
-                r'\d+',  # 整数（最後）
+                r'(?<![a-zA-Z\^])\d+(?![a-zA-Z])',  # 独立した整数（変数や演算子に囲まれていない）
             ]
             for pattern in complete_patterns:
                 matches = re.findall(pattern, line)
@@ -205,22 +204,19 @@ def extract_final_answer(text: str):
                     # 不完全な式でないことを確認
                     if cleaned and not re.match(r'^[A-Za-z\s]+$', cleaned) and not re.search(r'\\[a-zA-Z]+\s*$', cleaned):
                         return cleaned
-        
+
         # 4) 最後の非空行（最後の手段）
         last_line = lines[-1]
         cleaned = clean_answer(last_line)
         if cleaned:
             return cleaned
-    
+
     return None
 
 
 def normalize_answer(ans: str) -> str:
     """
     Self-consistency の多数決用に答案を正規化。
-    - 前後空白除去
-    - 余計な空白や改行を潰す
-    - 可能なら sympy で簡約して canonical に寄せる（例: 2/4 -> 1/2）
     """
     if ans is None:
         return ""
@@ -235,15 +231,12 @@ def normalize_answer(ans: str) -> str:
     # sympy で式として扱えるなら簡約（票割れを減らす）
     if sp is not None and s != "":
         try:
-            # sympyのパースエラーを防ぐため、安全にパース
             expr = sp.sympify(s, evaluate=False)
             expr_simplified = sp.simplify(expr)
-            # sympyの出力を文字列化（空白なし）
             s2 = str(expr_simplified)
             s2 = re.sub(r"\s+", "", s2)
             return s2
         except (sp.SympifyError, ValueError, SyntaxError, TypeError, Exception) as e:
-            # パースエラーは無視して元の文字列を返す
             pass
 
     return s
@@ -316,29 +309,24 @@ def make_messages(system_prompt: str, few_shots, problem_text: str):
 def verify_answer(problem_text: str, answer: str) -> bool:
     """
     答えが問題の条件を満たすか簡易検算。
-    - 数値として解釈できるか
-    - 整数条件（「何個」「何人」など）
-    - 正の数条件（「何歳」「何個」など）
-    - 基本的な範囲チェック
     """
     if not answer or answer.strip() == "":
         return False
-    
+
     # 答えから数値を抽出（FINAL: などのプレフィックス除去済みを想定）
     answer_clean = normalize_answer(answer)
-    
+
     # sympyで数値として解釈できるか試す
     if sp is not None:
         try:
-            # sympyのパースエラーを防ぐため、安全にパース
             expr = sp.sympify(answer_clean, evaluate=False)
             # 数値として評価できるか
             if expr.is_number:
                 num_val = float(expr.evalf())
-                
+
                 # 問題文から条件を推測
                 problem_lower = problem_text.lower()
-                
+
                 # 整数条件チェック（「何個」「何人」「何枚」など）
                 integer_keywords = ["how many", "何個", "何人", "何枚", "何本", "何台", "何回", "何点", "何歳"]
                 if any(kw in problem_lower for kw in integer_keywords):
@@ -346,23 +334,22 @@ def verify_answer(problem_text: str, answer: str) -> bool:
                         # 整数でない場合は、非常に近い整数かチェック
                         if abs(num_val - round(num_val)) > 1e-6:
                             return False
-                
+
                 # 正の数条件チェック（「何歳」「何個」など）
                 positive_keywords = ["how many", "何個", "何人", "何歳", "何枚", "何本", "何台", "何回", "何点", "area", "面積", "perimeter", "周長"]
                 if any(kw in problem_lower for kw in positive_keywords):
                     if num_val < 0:
                         return False
-                
+
                 # 極端に大きい値は不自然（10000以上は警告的だが、許容）
                 # 極端に小さい負の値も不自然
                 if num_val < -10000:
                     return False
-                
+
                 return True
         except (sp.SympifyError, ValueError, SyntaxError, TypeError, Exception) as e:
-            # パースエラーは無視して次のチェックに進む
             pass
-    
+
     # sympyで解釈できない場合でも、基本的な形式チェック
     # 空でなければ一旦許容（検算できないだけ）
     return len(answer_clean) > 0
@@ -372,10 +359,6 @@ def majority_vote(candidates, problem_text: str = None):
     """
     candidates: list[str] 生の答案（推論過程を含む可能性がある）
     problem_text: 問題文（検算用、オプション）
-    1) 各候補から最終的な答えを抽出
-    2) 検算をパスしたものだけを対象にする（problem_textがある場合）
-    3) 正規化して投票
-    4) 最頻値を返す（同率なら「最初に出たもの」を返す）
     """
     if not candidates:
         return ""
@@ -389,7 +372,6 @@ def majority_vote(candidates, problem_text: str = None):
                 extracted = c  # 抽出できなければ生のテキストを使用
             extracted_answers.append(extracted)
         except Exception:
-            # 抽出エラーが発生した場合は生のテキストを使用
             extracted_answers.append(c)
 
     # 検算をパスしたものだけをフィルタリング
@@ -403,18 +385,13 @@ def majority_vote(candidates, problem_text: str = None):
                     verified_answers.append(ans)
                     verified_raw.append(raw)
             except Exception:
-                # 検算エラーが発生した場合は検算をスキップして候補に含める
                 verified_answers.append(ans)
                 verified_raw.append(raw)
-        
+
         verified_count = len(verified_answers)
         if verified_answers:
             extracted_answers = verified_answers
             candidates = verified_raw
-            if verified_count < original_count:
-                print(f"  検算: {original_count}個中{verified_count}個を採用（{original_count - verified_count}個を除外）")
-        else:
-            print(f"  検算: 全ての候補が検算をパスしませんでした。全候補で多数決します。")
 
     # 抽出した答えを正規化して多数決
     normed = []
@@ -422,7 +399,6 @@ def majority_vote(candidates, problem_text: str = None):
         try:
             normed.append(normalize_answer(x))
         except Exception:
-            # 正規化エラーが発生した場合は元の文字列を使用
             normed.append(str(x) if x else "")
     counts = Counter(normed)
     best_norm, best_cnt = counts.most_common(1)[0]
@@ -442,10 +418,76 @@ def majority_vote(candidates, problem_text: str = None):
     return extracted_answers[0].strip() if extracted_answers else ""
 
 
-def main():
+async def process_one_problem(
+    client: AsyncOpenAI,
+    test_item: dict,
+    train_data: list,
+    vectorizer,
+    train_matrix,
+    system_prompt: str,
+    semaphore: asyncio.Semaphore,
+    index: int,
+    total: int
+):
+    """1つの問題を非同期で処理"""
+    async with semaphore:  # 並列数を制限
+        problem_id = test_item["id"]
+        problem_text = test_item["problem"]
+        problem_type = test_item.get("type")
+
+        print(f"[{index+1}/{total}] 問題ID {problem_id} ({problem_type}) を処理中...")
+
+        # Few-shot検索
+        few_shots = retrieve_few_shots(
+            problem_text, train_data, vectorizer, train_matrix, DYNAMIC_FEW_SHOT_K, problem_type
+        )
+
+        same_type_count = sum(1 for fs in few_shots if fs.get("type") == problem_type)
+        few_shot_types = [fs.get("type", "Unknown") for fs in few_shots]
+        print(f"  Few-shot例: {same_type_count}/{len(few_shots)}個が同じtype ({', '.join(few_shot_types)})")
+
+        messages = make_messages(system_prompt, few_shots, problem_text)
+
+        try:
+            # 非同期でAPI呼び出し
+            response = await client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                temperature=SC_TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+                n=SC_SAMPLES
+            )
+
+            candidates = []
+            for ch in response.choices:
+                if ch.message and ch.message.content:
+                    candidates.append(ch.message.content.strip())
+
+            # 多数決
+            final_answer = majority_vote(candidates, problem_text)
+
+            # 全候補から抽出した答えを表示
+            extracted_candidates = [extract_final_answer(c) or c[:30] + '...' for c in candidates]
+            print(f"  最終答え: {final_answer}")
+            print(f"  全{len(candidates)}個の候補: {extracted_candidates}")
+
+            return {
+                "id": problem_id,
+                "prediction": final_answer
+            }
+
+        except Exception as e:
+            print(f"問題ID {problem_id} の処理中にエラーが発生しました: {e}")
+            return {
+                "id": problem_id,
+                "prediction": f"ERROR: {e}"
+            }
+
+
+async def main():
     try:
         api_key = read_api_key(API_KEY_FILE)
-        client = OpenAI(api_key=api_key)
+        client = AsyncOpenAI(api_key=api_key)
 
         train_data = load_jsonl(TRAIN_FILE)
         test_data = load_jsonl(TEST_FILE)
@@ -467,71 +509,38 @@ def main():
             "- 例: FINAL: 24 または FINAL: \\frac{3}{2}"
         )
 
-        predictions = []
+        # セマフォで並列数を制限
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+        # 全問題を非同期で処理
         total_problems = len(test_data)
+        print(f"全{total_problems}問を最大{MAX_CONCURRENT}並列で処理開始...\n")
 
-        for i, test_item in enumerate(test_data):
-            problem_id = test_item["id"]
-            problem_text = test_item["problem"]
-            problem_type = test_item.get("type")
+        start_time = time.time()
 
-            print(f"問題ID {problem_id} ({problem_type}) を処理中... ({i + 1}/{total_problems})")
-
-            # --- Dynamic Few-shot: この問題に近い例を毎回選ぶ（同じtypeを優先） ---
-            few_shots = retrieve_few_shots(
-                problem_text, train_data, vectorizer, train_matrix, DYNAMIC_FEW_SHOT_K, problem_type
+        tasks = [
+            process_one_problem(
+                client, test_item, train_data, vectorizer, train_matrix,
+                system_prompt, semaphore, i, total_problems
             )
+            for i, test_item in enumerate(test_data)
+        ]
 
-            # Few-shot例の情報を表示
-            same_type_count = sum(1 for fs in few_shots if fs.get("type") == problem_type)
-            few_shot_types = [fs.get("type", "Unknown") for fs in few_shots]
-            print(f"  Few-shot例: {same_type_count}/{len(few_shots)}個が同じtype ({', '.join(few_shot_types)})")
+        predictions = await asyncio.gather(*tasks)
 
-            messages = make_messages(system_prompt, few_shots, problem_text)
-
-            try:
-                # --- Self-consistency: n本生成して多数決 ---
-                response = client.chat.completions.create(
-                    model=MODEL,
-                    messages=messages,
-                    temperature=SC_TEMPERATURE,
-                    max_tokens=MAX_TOKENS,
-                    n=SC_SAMPLES
-                )
-
-                candidates = []
-                for ch in response.choices:
-                    if ch.message and ch.message.content:
-                        candidates.append(ch.message.content.strip())
-
-                # majority_vote内で既に答えを抽出している
-                final_answer = majority_vote(candidates, problem_text)
-
-                # 全候補から抽出した答えを表示
-                extracted_candidates = [extract_final_answer(c) or c[:30] + '...' for c in candidates]
-                print(f"  最終答え: {final_answer}")
-                print(f"  全{len(candidates)}個の候補: {extracted_candidates}")
-
-                # score_math_test.pyは"prediction"フィールドを期待している
-                # 生の予測を保存（score_math_test.pyがextract_final_answerを使う）
-                # ただし、majority_voteで既に抽出されているので、それを保存
-                predictions.append({
-                    "id": problem_id,
-                    "prediction": final_answer
-                })
-
-            except Exception as e:
-                print(f"問題ID {problem_id} の処理中にエラーが発生しました: {e}")
-                predictions.append({"id": problem_id, "prediction": f"ERROR: {e}"})
-                time.sleep(5)
+        elapsed_time = time.time() - start_time
 
         write_jsonl(OUTPUT_FILE, predictions)
+
+        print(f"\n処理完了: {elapsed_time:.1f}秒 (平均: {elapsed_time/total_problems:.1f}秒/問)")
 
     except (FileNotFoundError, ValueError) as e:
         print(f"エラー: {e}")
     except Exception as e:
         print(f"予期せぬエラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
