@@ -243,14 +243,38 @@ def build_retriever(train_data):
     return vectorizer, train_matrix
 
 
-def retrieve_few_shots(problem_text, train_data, vectorizer, train_matrix, k: int):
+def retrieve_few_shots(problem_text, train_data, vectorizer, train_matrix, k: int, problem_type=None):
     """
     テスト問題に対して、train_data から類似度上位k件を返す。
+    problem_typeが指定されている場合は、同じtypeの問題を優先する。
     """
     q = vectorizer.transform([problem_text])
     sims = cosine_similarity(q, train_matrix).ravel()
-    top_idx = sims.argsort()[::-1][:k]
-    return [train_data[i] for i in top_idx]
+
+    if problem_type:
+        # 同じtypeの問題のインデックスを取得
+        same_type_indices = [i for i, item in enumerate(train_data) if item.get("type") == problem_type]
+        other_type_indices = [i for i, item in enumerate(train_data) if item.get("type") != problem_type]
+
+        # 同じtypeの中で類似度上位を選択
+        same_type_sims = [(i, sims[i]) for i in same_type_indices]
+        same_type_sims.sort(key=lambda x: x[1], reverse=True)
+
+        # k個選ぶ（同じtypeが足りない場合は他のtypeからも選ぶ）
+        selected_indices = [i for i, _ in same_type_sims[:k]]
+
+        if len(selected_indices) < k:
+            # 他のtypeから残りを選択
+            other_type_sims = [(i, sims[i]) for i in other_type_indices]
+            other_type_sims.sort(key=lambda x: x[1], reverse=True)
+            remaining = k - len(selected_indices)
+            selected_indices.extend([i for i, _ in other_type_sims[:remaining]])
+
+        return [train_data[i] for i in selected_indices]
+    else:
+        # typeが指定されていない場合は従来通り
+        top_idx = sims.argsort()[::-1][:k]
+        return [train_data[i] for i in top_idx]
 
 
 def make_messages(system_prompt: str, few_shots, problem_text: str):
@@ -429,13 +453,20 @@ def main():
         for i, test_item in enumerate(test_data):
             problem_id = test_item["id"]
             problem_text = test_item["problem"]
+            problem_type = test_item.get("type")
 
-            print(f"問題ID {problem_id} を処理中... ({i + 1}/{total_problems})")
+            print(f"問題ID {problem_id} ({problem_type}) を処理中... ({i + 1}/{total_problems})")
 
-            # --- Dynamic Few-shot: この問題に近い例を毎回選ぶ ---
+            # --- Dynamic Few-shot: この問題に近い例を毎回選ぶ（同じtypeを優先） ---
             few_shots = retrieve_few_shots(
-                problem_text, train_data, vectorizer, train_matrix, DYNAMIC_FEW_SHOT_K
+                problem_text, train_data, vectorizer, train_matrix, DYNAMIC_FEW_SHOT_K, problem_type
             )
+
+            # Few-shot例の情報を表示
+            same_type_count = sum(1 for fs in few_shots if fs.get("type") == problem_type)
+            few_shot_types = [fs.get("type", "Unknown") for fs in few_shots]
+            print(f"  Few-shot例: {same_type_count}/{len(few_shots)}個が同じtype ({', '.join(few_shot_types)})")
+
             messages = make_messages(system_prompt, few_shots, problem_text)
 
             try:
@@ -455,9 +486,11 @@ def main():
 
                 # majority_vote内で既に答えを抽出している
                 final_answer = majority_vote(candidates, problem_text)
-                
+
+                # 全候補から抽出した答えを表示
+                extracted_candidates = [extract_final_answer(c) or c[:30] + '...' for c in candidates]
                 print(f"  最終答え: {final_answer}")
-                print(f"  候補例（最初の3個、抽出前）: {[extract_final_answer(c) or c[:50] + '...' for c in candidates[:3]]}")
+                print(f"  全{len(candidates)}個の候補: {extracted_candidates}")
 
                 # score_math_test.pyは"prediction"フィールドを期待している
                 # 生の予測を保存（score_math_test.pyがextract_final_answerを使う）
