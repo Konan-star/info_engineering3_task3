@@ -1,6 +1,7 @@
 import json
 import re
-import time
+import sys
+import datetime
 from openai import OpenAI
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -9,15 +10,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 # =========================
 TRAIN_FILE = "math_train80.jsonl"
 TEST_FILE = "noanswer_val20.jsonl"
-OUTPUT_FILE = "val20_preds.jsonl"
+OUTPUT_FILE = "val20_pred.jsonl"
 MODEL = "gpt-4o-mini"
 API_KEY_FILE = "API.txt"
+thrsd = 0.7 # 似た step だと判断する閾値（大きいと選考基準が厳しくなる）
 
-STEP_SIM_THRESHOLD = 0.3
-
-# =========================
-# utilis.pyに対応する部分
-# =========================
 def read_api_key(path):
     with open(path) as f:
         return f.read().strip()
@@ -26,6 +23,9 @@ def load_jsonl(path):
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f]
 
+# =========================
+# utilis.pyに対応する部分
+# =========================
 def extract_answer(text):
     m = re.search(r"FINAL:\s*(.+)", text) # FINALの後にある空白を無視して、後の文章をとってくる
     return m.group(1).strip() if m else "" # mがあれば前後の空白を消して返し、なければ" "を返す
@@ -45,9 +45,10 @@ def construct_message(problem, solution, example, has_example, first_step):
             messages.append({"role": "user", "content": example})
     return messages
 
-def save_result(result: dict, output_file: str):
-    with open(output_file, "a", encoding="utf-8") as f:
-        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+def save_result(result, output_file):
+    with open(output_file, 'a') as f:
+        json_str = json.dumps(result)
+        f.write(json_str + '\n')
 
 # =========================
 # example.pyに対応する部分
@@ -57,16 +58,16 @@ def convert_example(question, step_num):
     steps リストを使って、
     指定された step_num だけを Key Step として強調する
     """
-    steps = question["steps"]
     example = 'Problem: ' + question['problem'] + '\n'
-    for i, s in enumerate(steps): # stepsリストの番号iと中身s
-        if i == step_num:
-            example += f'Key Step {i+1}: {s}\n'
-        else:
-            example += f'Step {i+1}: {s}\n'
+    for i, s in enumerate(question["steps"]):
+            curr_step_num = i + 1
+            if curr_step_num== step_num:
+                example += f'Key Step: Step {curr_step_num}: {s}\n'
+            else:
+                example += f'Step {curr_step_num}: {s}\n'
     return example
 
-def construct_example_bank(file_path):
+def construct_example_bank(file_path=TRAIN_FILE):
     """
     solution から step リストを作る
     各 step をベクトル化して、似た step を検索できる状態にする
@@ -77,26 +78,26 @@ def construct_example_bank(file_path):
     example_step = [] # 全問題の全 step を一列に並べたリスト
     problem2step = {} # step → どの問題の何番目のstepかの対応表
 
-    with open(file_path, 'r', encoding='utf-8') as file:
+    with open(file_path, 'r') as file:
         for line in file:
             question = json.loads(line)
             steps = [s.strip() for s in question["solution"].split("\n") if s.strip()] # solution を改行で分割して steps にする
-            data_example.append({
-                "problem": question["problem"],
-                "steps": steps
-            })
-            for i, s in enumerate(steps):
-                example_step.append(s)
-                problem2step[id2] = (id1, i)
+            data_example.append({"problem": question["problem"], "steps": steps})
+
+            for i, step_text in enumerate(steps):
+                step_name = f"Step {i+1}"
+                example_step.append(step_text)
+                problem2step[id2] = [id1, step_name]
                 id2 += 1
             id1 += 1
-        vectorizer = TfidfVectorizer() # step をベクトル化
-        tfidf_matrix = vectorizer.fit_transform(example_step)
-        embeddings = tfidf_matrix.toarray()  # numpy array に変換
-        
-        return vectorizer, tfidf_matrix, embeddings, problem2step, data_example
 
-def retrieve_step(key, vectorizer_step, example_step_embeddings, problem2step, example_data, thrsd=0.7):
+        vectorizer_example_step = TfidfVectorizer() # step をベクトル化
+        tfidf_matrix_example_step = vectorizer_example_step.fit_transform(example_step)
+        example_step_embeddings = tfidf_matrix_example_step.toarray()
+
+        return vectorizer_example_step, tfidf_matrix_example_step, example_step_embeddings, problem2step, data_example
+
+def retrieve_step(key, vectorizer_step, example_step_embeddings, problem2step, example_data, thrsd):
     """
     現在の解答の途中（key）に最も似ている過去のステップを検索し、類似度が閾値以上なら参考例として返す
     """
@@ -108,118 +109,108 @@ def retrieve_step(key, vectorizer_step, example_step_embeddings, problem2step, e
     example_step = problem2step[similarities.argmax()][1] # 最も類似しているステップのステップ番号
 
     if max_similarity >= thrsd: # 類似度が閾値以上なら、そのステップを参考例として採用
-        has_example = True
-        example = 'Example: ' + convert_example(example_data[example_num], example_step)
-        print("Example for current step: " + str(example_step))
+        has_example =  True
+        example = 'Example: ' + convert_example(example_data[example_num], int(example_step.rsplit(' ', 1)[-1]))
+        print("Example for current step: " + example_step)
+
     else:
         has_example = False
         example = ""
-        print("No Example for this step")
+        print ("No Example for this step")
 
     return has_example, example
 
 # =========================
 # reasoning.pyに対応する部分
 # =========================
-def first_try(client, problem, pre_solution, first_step, amc=None):
+def first_try(client, problem, pre_solution, first_step):
     example = ""
     has_example = False
     messages = construct_message(problem, pre_solution, example, has_example, first_step)
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=MODEL,
         messages=messages,
         temperature=0,
         max_tokens=5000,
         top_p=1
     )
-    
     first_try_reasoning = response.choices[0].message.content
-    print("first_try for this step: " + first_try_reasoning)
+    print("first try for this step: " + first_try_reasoning)
     return first_try_reasoning
 
-def solve(client, whole_problem, vectorizer_step, example_step_embeddings, problem2step, example_data, thrsd=0.7):
-    """
-    ステップごとの推論:
-    1. first_try で現在ステップを生成
-    2. 類似ステップを retrieve_step で参照
-    3. 参照例を使って最終ステップ生成
-    """
+def solve(client, whole_problem, vectorizer_step, example_step_embeddings, problem2step, example_data, thrsd):
+    flag = 0
     problem = 'Problem: ' + whole_problem['problem']
+    example_num = 0
+    max_similarity = 0
     total_solution = ""
     
     step_num = 0
     max_step = 20
     first_step = True
-    
     while True:
         step_num += 1
-        print(f"Step-{step_num}: first_try reasoning")
-  
-        # まず最初の推論ステップを生成
+        print(f"first try for step-{step_num}:")
         first_try_reasoning = first_try(client, problem, total_solution, first_step)
-        print(f"first_try result: {first_try_reasoning}")    
         
-        # 類似ステップを探す
+        print(f"finding example step for step-{step_num}")
         has_example, example_step = retrieve_step(first_try_reasoning, vectorizer_step, example_step_embeddings, problem2step, example_data, thrsd)
-        print(f"Example found: {has_example}")     
         
-        # 最終ステップ生成
+        print(f"generating final step for step-{step_num}")
         new_message = construct_message(problem, total_solution, example_step, has_example, first_step)
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=MODEL,
             messages=new_message,
             temperature=0,
             max_tokens=5000,
             top_p=1
         )
         final_reasoning = response.choices[0].message.content
-        print(f"final reasoning: {final_reasoning}")
-        
+        print("final reason for this step: " + final_reasoning)
         pre_solution = total_solution
         total_solution += final_reasoning
-        first_step = False     
-        
-        # 終了条件
+        first_step = False
+
         if 'FINAL:' in total_solution:
-            break    
-        # 行き詰まった場合はループ終了（0-shot 部分は削除）
+            break
+        
         if step_num > max_step or final_reasoning in pre_solution:
             print("Reached max steps or repetition detected. Stopping step-by-step reasoning.")
             break
     
     answer = extract_answer(total_solution)
+        
     return total_solution, answer
 
 # =========================
 # Main
 # =========================
 def main():
-    client = OpenAI(api_key=read_api_key(API_KEY_FILE))
-    vectorizer, tfidf_matrix, embeddings, problem2step, data_example = construct_example_bank(TRAIN_FILE)
-    test_data = load_jsonl(TEST_FILE)
-    for problem_item in test_data:
-        print(f"Solving ID {problem_item['id']}...")     
-        # ステップごと推論
-        total_solution, answer = solve(
-            client, 
-            problem_item, 
-            vectorizer, 
-            embeddings,
-            problem2step, 
-            data_example, 
-            thrsd=STEP_SIM_THRESHOLD
-        )
-        # predictionを必ず"FINAL: ..."形式にする
-        if answer:
-            prediction = f"FINAL: {answer}"
-        else:
-            # もし抽出できなければ空の文字列
-            prediction = "FINAL: "
-        save_result({
-            "id": problem_item["id"],
-            "prediction": prediction
-        }, OUTPUT_FILE)
-        time.sleep(1)
+    client = OpenAI(
+        api_key=read_api_key(API_KEY_FILE),
+    )
 
-if __name__ == "__main__":
+    data=[]
+   
+    with open(TEST_FILE, 'r') as file:
+        for line in file:
+            data.append(json.loads(line))
+
+    vectorizer_example_step, tfidf_matrix_example_step, example_step_embeddings, problem2step, data_example = construct_example_bank(TRAIN_FILE)
+
+    for whole_problem in data:
+        total_solution, answer = solve(client, whole_problem, vectorizer_example_step, example_step_embeddings, problem2step, data_example, thrsd)
+        if answer:
+            prediction = f"FINAL: {answer}" # predictionを必ず"FINAL: ..."形式にする
+        else:
+            prediction = "FINAL: "
+        save = {'id': whole_problem['id'], "prediction": answer}
+        print(save)
+        save_result(save, OUTPUT_FILE)
+
+if __name__ == '__main__':
+    t = str(datetime.datetime.now())
+    out_file = t[2:][:-7] + '.txt'
+    sys.stdout = open(out_file, 'a', buffering=30000)
+    sys.stderr = open(out_file, 'a', buffering=30000)
     main()
